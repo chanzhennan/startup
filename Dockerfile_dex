@@ -1,0 +1,400 @@
+# dockerfile编写原则：
+# 1.能写到一条RUN指令里就不要分两条，这样镜像会小一些；
+# 2.由于docker是分层编译保留中间镜像，多次编译时只要从开头到某个位置的dockerfile内容没有更改，
+#   后续编译就会直接使用先前编译好的中间镜像以节省时间，所以当多个软件包没有相互依赖关系可以任意调整排列顺序时，
+#   耗时长、复杂的模块应该放在前面，减少其前面的dockerfile有更改的概率，从而减少重新编译耗时模块的概率，节省时间；
+# 3.COPY命令会单独建立一层，这使得下载-安装-删除安装包的过程没有办法写在一条RUN语句内来节约空间，这是一个可以优化的地方，比如通过wget在编译时从宿主机下载文件而不是直接COPY，除非这些文件后续需要一直保留
+# 4*.apt-get update命令会在/var/lib/apt/lists目录下新增文件
+# 4.apt-get install命令会将软件安装包下载到/var/cache/apt/archives/ 作为缓存，使用apt clean命令清除它们，参考：https://linux.cn/article-12787-1.html
+# 5.pip install命令会将软件安装包下载到~/.cache/pip 作为缓存，使用--no-cache-dir参数避免在安装时建立缓存
+# 镜像编译命令：
+# docker build --build-arg NPROC_BUILD=$((`nproc`-2)) --build-arg LOCAL_IP=192.168.3.73 -t 192.168.3.72:5000/mixedai-cuda:版本号 .
+# NOTE: 在不删除文件的情况下，多条RUN跟合并成一条的大小应该是基本没有差别的，为了编译的便捷性和代码的可读性，有时候也可以拆分成多条RUN
+
+# 小贴士: 
+# dpkg -l可以查看已经装了哪些包，看看有没有什么是不需要的，可以直接remove掉它和它的依赖；
+# apt show package_name -a | grep Depends 可以查看这个包的依赖都有些啥
+# 关于apt-get install什么时候会询问Y/N需要加-y，如果请求的包名正好有对应的包且不需要加装其他依赖项，则不会过问，否则则会问用户，一共要装这些包，是否同意
+# 配置环境变量有讲究，如果一个名字同时在两个路径中存在，系统会优先选择排在前面的，所以我们自己安装的东西，路径最好放在$PATH的前面，这样才能选中我们新增的配置
+
+# TODO: 用谷歌的container-diff工具检查每个RUN之后的diff，看看有没有多余的文件可以删掉节省
+# 空间；也可以先启动容器，手动运行RUN语句里头的命令，然后docker diff container_id检查是否
+# 多出来预期之外的文件，是否可以删除以节省空间
+# CUDA Toolkit版本与显卡驱动版本的对应关系表（文中表3）：https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
+# runtime版本的镜像没有nvcc命令，/usr/local/cuda目录下少了很多目录，导致无法安装pytorch，因此目前只能使用devel版本镜像（大了几个G）
+FROM nvidia/cuda:11.2.1-cudnn8-devel-ubuntu20.04
+
+# 设置在apt-get install时不弹出对话框，ARG设置的参数仅在编译时生效，编译后自动失效
+# apt install会给WARNING: apt does not have a stable CLI interface. Use with caution in scripts，意思就是apt可能会弹交互界面，最好不要在脚本里用，最好还是用apt-get
+# 参考：https://bobcares.com/blog/debian_frontendnoninteractive-docker/
+ARG DEBIAN_FRONTEND=noninteractive
+
+# 时区
+ARG TZ=Asia/Shanghai
+
+# 宿主机IP（在docker容器中，访问本地环回不能用127.0.0.1，而要用真实的ip地址）
+#ARG LOCAL_IP=192.168.3.72
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN export http_proxy=http://127.0.0.1:8118
+RUN export https_proxy=http://127.0.0.1:8118
+
+
+# 代理服务器配置
+##ARG http_proxy=""
+
+# 编译时使用的进程核数量，可以在外面传参设置，如果是服务器应当留一两个核给其他人用防止完全动不了
+ARG NPROC_BUILD=4
+
+# 关于压缩镜像大小时使用docker diff container_id确认增加的文件之后不知道哪些可以删哪些不可以的问题：
+# /usr/lib 目录存放软件安装后生成的动态库和程序，不可删除
+
+# 设置apt源并进行update
+# NOTE: Ubuntu20.04和18.04，它们的源是不一样的，sources.list无法通用，且blender的安装与系统版本有关，直接换镜像版本会导致blender安装出错
+#COPY --chown=root:root ./sources.list /etc/apt
+RUN rm -rf /var/lib/apt/lists/* && apt-get update
+
+# 基本配置
+# 先装apt-utils减少"apt-utils尚未安装"的WARNING
+# 然后设置时区
+# 再把一些最常用的基础工具库装了
+# NOTE: 由于vim依赖到libpython3.8，libpython又依赖到tzdata，所以应当把tzdata的配置前移；且openssh-server也依赖了python3.8，所以剔除python3.8
+# 基本不可能了，只能等用conda管python了
+# 以前都是用的apt-get clean，后来不知道在哪看到别人的Dockerfile用的是apt-get clean && apt-get autoclean && apt-get autoremove，于是照抄再加上-y
+# .vimrc是网上找的一个功能齐全的vim配置文件
+# 有时候可能会有ssh连上容器的需求（比如determined集群的det shell命令），所以增加一下对应的目录
+# 本RUN语句新增1.53G内容，大多数位于/usr/lib，都是so文件，小部分位于/usr/share，放着时区、文本编辑器等共用的配置，还是不要动它了
+RUN apt-get install -y apt-utils \
+ && apt-get install -y tzdata \
+ && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && echo "current time after setting timezone: `date`" \
+ && apt-get install -y build-essential wget curl git subversion vim mlocate zip cmake net-tools iputils-ping openssh-server ca-certificates \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/base/.vimrc -P ~/ \
+ && mkdir /run/sshd
+
+
+# 与编译C代码相关的依赖
+# cmake-curses-gui是cmake的gui工具，ccmake .可以查阅并修改cmake命令所能修改的所有参数，好用，想哥力荐
+RUN apt-get install -y libffi-dev libc++-7-dev libc++abi-7-dev libjemalloc2 libtool ninja-build cmake-curses-gui \
+ libboost-system-dev libboost-thread-dev libboost-program-options-dev libboost-test-dev libboost-filesystem-dev \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y
+
+
+# 一些忘记出处的依赖，归到一行里头
+# libopenimageio-dev的依赖贼多，不知道是哪个库需要用到它
+RUN apt-get install -y libssl-dev libembree-dev libopenimageio-dev libglfw3-dev libassimp-dev libjpeg-dev zlib1g-dev openexr \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y
+
+
+# 安装pyQt5也即MixedAIGUI启动所需的依赖
+RUN apt-get install -y libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 \
+ libx11-dev libxkbcommon-x11-0 libxtst6 x11-apps \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y
+
+
+# 配置python和pip：安装python3.8，调整软链，配置源，配置PYTHONPATH
+# 自己编译出来的python识别不了退格键跟方向键，会显示成^H和^A等，需要在编译之前安装libreadline-dev：https://blog.csdn.net/m0_52394388/article/details/120555896
+# eigen库用于编译python跟C++混合的项目，tk8.6-dev在编译带tkinter的python时需要用到，libsqlite3-dev是sqlite3要用的
+# 关于手动编译python的./configure中有哪些参数可以调整，详见：https://docs.python.org/3/using/configure.html
+# 编译版python安装tkinter比较麻烦，直接apt-get install python3-tk装不到那个位置，就很坑，参考链接；https://tkdocs.com/tutorial/install.html#install-x11-python
+# 我们会用到lzma包，要事先apt装好liblzma-dev，在编译python的时候才会顺带编译这个python包，参考链接；https://stackoverflow.com/questions/57743230/userwarning-could-not-import-the-lzma-module-your-installed-python-is-incomple
+# 同理，我们会用到bz2包，要事先apt装好libbz2-dev
+# 以防万一，安装过程中提示没找到相关组件的dbm跟gdbm都安装一下，分别需要libgdbm-dev和libgdbm-compat-dev
+# 凡是原本在lib-dynload/目录下有的包，在换成手动编译后找不到的，均为类似的问题，需要先apt装某一个dev包才能自动编译
+# 通过apt-get安装的python，其包目录是dist-packages，通过编译安装的则是site-packages
+# 配置时--enable-optimizations参数使用已知可靠的优化手段，--enable-shared编译python共享库，因为AlgoUtils在编译时需要用到libpython3.x.a
+# --prefix设置安装目录，默认是/usr/local，可奇怪的是手动设置之后在安装blender，cmake的时候会报"Could NOT find PythonLibsUnix"，按默认的就不会，对比了半天也没看出啥区别来，离谱
+# --enable-loadable-sqlite-extensions安装sqlite3相关套件，algo_utils会用到，参考链接：https://stackoverflow.com/questions/1210664/no-module-named-sqlite3
+# --with-tcltk-includes跟--with-tcltk-libs配置tkinter的安装
+# 参考链接：https://stackoverflow.com/questions/35866369/how-to-manually-install-python-dev-from-source
+# 编译的时候送的pip是21.1.1，版本太高了，它会在根据requirements.txt时，如果txt以外的包版本发生冲突，就自动下载更低版本的包以尝试解决冲突，
+# 但问题是如果一直找不到，程序就会卡住，比如现在就是这样，所以要把pip版本退回到没有这个功能的时候才能完成安装
+# LD_LIBRARY_PATH环境变量是系统寻找so文件的路径列表
+# python-numpy依赖python2.7，装完它又会多出来一个python2.7，离谱，不管它，就放那
+# 不过只有几十M，不删也行，后面安装的包是装在/usr/local/lib/python3.9里头，不是同一个地方
+# 本RUN语句新增92M内容
+# Python-3.8.10是项目侧使用的Python版本
+ARG PYTHON_VER=Python-3.8.10
+ARG PY_PREFIX=/usr/local
+WORKDIR /usr/local/src
+RUN apt-get update \
+ && apt-get install -y libreadline-dev libeigen3-dev python-numpy tk8.6-dev libsqlite3-dev liblzma-dev libbz2-dev libgdbm-dev libgdbm-compat-dev \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+ && ln -s /usr/include/eigen3/Eigen /usr/include/Eigen \
+ && ln -s /usr/include/eigen3/unsupported /usr/include/unsupported \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/python/$PYTHON_VER.tgz \
+ && tar -xvf $PYTHON_VER.tgz > /dev/null \
+ && cd $PYTHON_VER \
+ && ./configure --enable-shared --enable-optimizations \
+  --enable-loadable-sqlite-extensions \
+  --with-tcltk-includes='-I/usr/include/tcl8.6' \
+  --with-tcltk-libs='/usr/lib/x86_64-linux-gnu/libtcl8.6.so /usr/lib/x86_64-linux-gnu/libtk8.6.so' \
+ && make -j$NPROC_BUILD \
+ && make install \
+ && ln -s $PY_PREFIX/bin/pip3 $PY_PREFIX/bin/pip \
+ && ln -s $PY_PREFIX/bin/python3 $PY_PREFIX/bin/python \
+ && rm -rf /usr/local/src
+# python的包的存放路径貌似是固定搭配，改不了的
+ENV PACKAGE_DIR=$PY_PREFIX/lib/python3.8/site-packages
+ENV PYTHONPATH=$PACKAGE_DIR:$PYTHONPATH
+ENV PATH=$PY_PREFIX/bin:$PATH
+ENV LD_LIBRARY_PATH=$PY_PREFIX/lib:$LD_LIBRARY_PATH
+RUN mkdir /root/.pip \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/base/pip.conf -P /root/.pip/ \
+ && pip install --no-cache-dir --upgrade pip==20.0.2
+
+
+# 安装blender依赖包，参考kubric的安装方式
+# wget -q在下载过程中不输出进度，否则整个屏幕都是进度信息
+# NOTE: 这里有个坑，由于python是编译版，tkinter也需要自己编译，需要安装带-dev的tkinter包，这个包带有libpng16.a文件（本机事先只有libpng16.so），
+# 会导致blender在编译到100%的时候报错：
+# /usr/bin/ld.gold: error: /usr/lib/x86_64-linux-gnu/libpng.a(pngerror.o): requires dynamic R_X86_64_PC32 reloc against 'stderr' which may overflow at runtime; recompile with -fPIC，
+# 由于.a文件是直接下载来的不是在本机编译的，所以这边没有办法去重新编译，只能先把.a文件移走，待blender编译完再移回来，曲线救国
+# 本RUN语句新增346M内容
+# WORKDIR /usr/local/src
+# RUN apt-get install -y libxxf86vm-dev libxi-dev libxi6 \
+#  && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+#  && mv /usr/lib/x86_64-linux-gnu/libpng.a /tmp/ \
+#  && mv /usr/lib/x86_64-linux-gnu/libpng16.a /tmp/ \
+#  && wget -q $LOCAL_IP/MixedAI/docker_packages/blender/blenderpy2.93.zip && unzip -q blenderpy2.93.zip \
+#  && cd blenderpy2.93/blender \
+#  && make -j$NPROC_BUILD bpy \
+#  && cp /usr/local/src/blenderpy2.93/build_linux_bpy/bin/bpy.so $PACKAGE_DIR \
+#  && cp -r /usr/local/src/blenderpy2.93/lib/linux_centos7_x86_64/python/lib/python3.9/site-packages/2.93 $PACKAGE_DIR/2.93 \
+#  && mv /tmp/libpng.a /usr/lib/x86_64-linux-gnu/ \
+#  && mv /tmp/libpng16.a /usr/lib/x86_64-linux-gnu/ \
+#  && rm -rf /usr/local/src
+
+# 上面的简洁版安装在bpy.ops.rigidbody.object_add()时会报错"Compiled without Bullet physics engine"，用不了，先退回来；
+# 有可能是因为没有执行install_deps.sh，也可能没有那么简单
+# 安装blender依赖包
+# 在docker容器中，访问本地环回不能用127.0.0.1，而要用真实的ip地址
+# wget -q在下载过程中不输出进度，否则整个屏幕都是进度信息
+# blender2.93以上只支持python3.9，但项目侧使用的是python-3.8.10，因此装3.9仅用于编译blender
+# 这样做会引入另一个问题，cmake找python库的时候会优先找通过apt安装的py3.9，而实际装包的是py3.8，这样就会导致报错找不到包，参考链接：https://stackoverflow.com/questions/68913248/cmake-error-could-not-find-python-missing-python-numpy-include-dirs-numpy-f
+# 本RUN语句新增1.54G内容
+WORKDIR /usr/local/src
+RUN apt-get install -y sudo python3.9-dev \
+ && wget -q ${LOCAL_IP}/MixedAI/docker_packages/blender/blender-git.zip && unzip -q blender-git.zip \
+ && wget -q ${LOCAL_IP}/MixedAI/docker_packages/blender/src.zip && unzip -q src.zip \
+ && wget -q ${LOCAL_IP}/MixedAI/docker_packages/blender/lib.zip && unzip -q -d /opt lib.zip \
+ && cd blender-git/blender \
+ && ./build_files/build_environment/install_deps.sh \
+ && mkdir ../build_linux && cd ../build_linux \
+ && cmake ../blender -D WITH_CODEC_SNDFILE=ON -D PYTHON_VERSION=3.9 -D WITH_OPENCOLORIO=ON \
+ -D OPENEXR_ROOT_DIR=/opt/lib/openexr -D OPENCOLORIO_ROOT_DIR=/opt/lib/ocio \
+ -D WITH_OPENIMAGEIO=ON -D OPENIMAGEIO_ROOT_DIR=/opt/lib/oiio -D WITH_CYCLES_OSL=ON \
+ -D WITH_LLVM=ON -D LLVM_VERSION=10.0.0 -D OSL_ROOT_DIR=/opt/lib/osl -D WITH_OPENSUBDIV=ON \
+ -D OPENSUBDIV_ROOT_DIR=/opt/lib/osd -D WITH_OPENVDB=ON -D WITH_OPENVDB_BLOSC=ON \
+ -D OPENVDB_ROOT_DIR=/opt/lib/openvdb -D BLOSC_ROOT_DIR=/opt/lib/blosc -D WITH_ALEMBIC=ON \
+ -D ALEMBIC_ROOT_DIR=/opt/lib/alembic -D WITH_USD=ON -D USD_ROOT_DIR=/opt/lib/usd -D WITH_FFTW3=ON \
+ -D WITH_CODEC_FFMPEG=ON \
+ -D FFMPEG_LIBRARIES='avformat;avcodec;avutil;avdevice;swscale;swresample;lzma;rt;theora;theoradec;theoraenc;vorbis;vorbisenc;vorbisfile;ogg;x264;openjp2' \
+ -D WITH_XR_OPENXR=ON \
+ -D XR_OPENXR_SDK_ROOT_DIR=/opt/lib/xr-openxr-sdk \
+ -D WITH_PYTHON_INSTALL=OFF \
+ -D WITH_AUDASPACE=OFF \
+ -D WITH_PYTHON_MODULE=ON \
+ -D WITH_INSTALL_PORTABLE=OFF \
+ -D PYTHON_SITE_PACKAGES=$PACKAGE_DIR \
+ && make clean \
+ && make -j4 \
+ && make install \
+ && rm -rf /usr/local/src
+ENV LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+
+
+# 安装python依赖库
+# 有些库依赖到pytorch，其会自己去下载最新版本的pytorch，而后被我们的pytorch覆盖，为了避免
+# 这种情况发生，把依赖分成两部分，先装不需要pytorch的，然后安装pytorch，再装需要pytorch的
+# graphviz-dev是"graphviz" python包的依赖
+# 之前都好好的，突然有一天跑到这个位置会报错Failed to fetch http://mirrors.aliyun.com/ubuntu/pool/main/c/cups/libcups2_2.3.1-9ubuntu1.1_amd64.deb 404 Not Found [IP: 121.9.203.224 80] 
+# E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?
+# 需要apt-get update才能解决，但是前面并没有改到apt源的什么东西，就很奇怪，总之更新就更新吧，不管太多了（后记：1.8.4版本又没有这个问题了，真奇怪）
+# NOTE: 豆瓣源不知道怎么回事，装包装到一半会报ConnectionResetError(104, 'Connection reset by peer')，
+# 每次停的位置都不一样，换了清华源居然也是第一次就报这个错。怀疑是请求速度太快被block了，加了睡眠1s，可是
+# pip在装包自己的依赖的时候是没有延时的，所以还是会有一部分被拒，就很蛋疼，又不想搞代理，最后决定来个循环，
+# 不成功就下到它成功。因为要尝试多次，所以pip下载缓存就先留着了，最后再统一删除，不然每次都去下载更容易被拦
+# 老是弹WARNING: You are using pip version 20.0.2; however, version 22.1.1 is available，烦人，在这里disable一下，装完再还原
+# 本RUN语句新增6.7G内容
+WORKDIR /usr/local/src
+RUN apt-get install -y graphviz-dev \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/base/requirements_before_torch.txt \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/base/requirements_after_torch.txt \
+ && sed -i "/^#.*\|^$/d" requirements_before_torch.txt \
+ && sed -i "/^#.*\|^$/d" requirements_after_torch.txt \
+ && pip config set global.disable-pip-version-check true \
+ && while read line; do \
+        package=`echo $line | awk -F'==' '{print $1}'`; \
+        pip install $line; \
+        while [ `pip show $package | grep -c ""` -eq 0 ] ; do \
+            pip install $line; \
+            sleep 0.5s; \
+        done; \
+    done < requirements_before_torch.txt \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/wheel/torch-1.9.0+cu111-cp38-cp38-linux_x86_64.whl -P ./ \
+ && python3 -m pip install torch-1.9.0+cu111-cp38-cp38-linux_x86_64.whl \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/wheel/torchvision-0.10.0+cu111-cp38-cp38-linux_x86_64.whl -P ./ \
+ && python3 -m pip install torchvision-0.10.0+cu111-cp38-cp38-linux_x86_64.whl \
+ && while read line; do \
+        package=`echo $line | awk -F'==' '{print $1}'`; \
+        pip install $line; \
+        while [ `pip show $package | grep -c ""` -eq 0 ] ; do \
+            pip install $line; \
+            sleep 0.5s; \
+        done; \
+    done < requirements_after_torch.txt \
+ && pip config set global.disable-pip-version-check false \
+ && rm -rf /usr/local/src ~/.cache/pip
+
+
+# 安装Open3D
+# 从上一层开始编译新镜像的时候又出了这个问题：E: Failed to fetch http://xxxxx  404  Not Found [IP: 119.147.41.248 80]
+# E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?
+# 就很烦，临时在这里apt-get update治个标
+# 本RUN语句新增1.59G内容
+WORKDIR /usr/local/src
+RUN apt-get update \
+ && apt-get install -y libgomp1 libglu1-mesa-dev libsdl2-dev libtbb-dev libosmesa6-dev libudev-dev xorg-dev \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/Open3D-master-dexforce.zip && unzip -q -d /usr/local/src Open3D-master-dexforce.zip \
+ && mkdir Open3D-master/build && cd Open3D-master/build \
+ && cmake .. \
+ && make -j$NPROC_BUILD \
+ && make install \
+ && mv /usr/local/src/Open3D-master/build/lib/Python/* $PACKAGE_DIR \
+ && rm -rf /usr/local/src
+
+
+# 安装opencv
+# 安装过程中会下载一些包的源码或者依赖，github下载速度感人，故需要把文件事先在本地准备好，直接调用本地的文件
+# 修改IPPICV的安装配置，将其定向到我们自己的url，参考链接：https://www.jianshu.com/p/3c2fc0da7398
+# sed -i 是替换后写入文件，42c表示对第42行进行替换，整个语句就是把ippicv.cmake的第42行由http开头的url替换成了我们自己的url
+# 修改gapi中关于ADE的安装配置，将其定向到我们自己的url，参考链接：https://blog.csdn.net/wzw_2008/article/details/106944407
+# 修改xfeature2d的安装配置，将其定向到我们自己的url，参考链接：https://github.com/opencv/opencv_contrib/issues/1301
+# 由于raw.githubusercontent.com在没有代理的时候网速很慢，加上我们并不需要安装contrib所有的模块（很多都是实验性的），
+# 因此可以通过-D BUILD_opencv_modulea=OFF 参数来取消安装opencv-contrib/modules/ 目录下的modulea模块
+# NOTE：自己编译opencv-contrib失败了，一个是cmake之后python3那一列的配置lib，numpy和path都是空的，一个是cmake的时候总是卡在各种包的下载上，所以先搁置了，还是用pip install安装一个python版的先用着
+# 手动编译的好处是C++跟python的版本会自动一致的，分成pip装一个然后这边编译一个要手动装好与编译版本对应的版本号，版本不一致可能会出问题
+# 在CMakeList中，引用环境变量的方式是$ENV{LOCAL_IP}
+# 以WITH_开头的参数可以控制单个位于opencv_contrib/modules目录下的依赖是否编译
+# 以BUILD_开头的参数可以控制单个位于3rdparty目录下的第三方库是否编译
+# opencv安装包各个目录下面的readme有对应的-D命令，如果不清楚可以去看一下
+# AlgoUtils中的CircleDet包需要用到opencv_world库，默认不安装，这里需要启动一下
+# 像wechat_qrcode这种下载耗时又用不到的包，直接disable掉
+# 本RUN语句新增106M内容
+WORKDIR /usr/local/src
+RUN apt-get install -y libopenexr-dev libxxf86vm-dev libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev libglew-dev \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/opencv/opencv-4.5.3.zip && unzip -q -d /usr/local/src opencv-4.5.3.zip \
+ && mkdir opencv-4.5.3/build && cd opencv-4.5.3/build \
+ && sed -i '42c \                 "$ENV{LOCAL_IP}/MixedAI/docker_packages/opencv/"' /usr/local/src/opencv-4.5.3/3rdparty/ippicv/ippicv.cmake \
+ && sed -i '10c \               "$ENV{LOCAL_IP}/MixedAI/docker_packages/opencv/"' /usr/local/src/opencv-4.5.3/modules/gapi/cmake/DownloadADE.cmake \
+ && sed -i '27c \                   "$ENV{LOCAL_IP}/MixedAI/docker_packages/opencv/xfeatures2d/boostdesc/"' /usr/local/src/opencv-4.5.3/opencv_contrib/modules/xfeatures2d/cmake/download_boostdesc.cmake \
+ && sed -i '21c \                   "$ENV{LOCAL_IP}/MixedAI/docker_packages/opencv/xfeatures2d/vgg/"' /usr/local/src/opencv-4.5.3/opencv_contrib/modules/xfeatures2d/cmake/download_vgg.cmake \
+ && sed -i '19c \                   "$ENV{LOCAL_IP}/MixedAI/docker_packages/opencv/face/"' /usr/local/src/opencv-4.5.3/opencv_contrib/modules/face/CMakeLists.txt \
+ && cmake -D BUILD_opencv_python3=yes \
+  -D BUILD_opencv_python2=no \
+  -D OPENCV_EXTRA_MODULES_PATH=../opencv_contrib/modules ../opencv \
+  -D OPENCV_GENERATE_PKGCONFIG=ON \
+  -D BUILD_opencv_world=ON \
+  -D BUILD_opencv_wechat_qrcode=OFF \
+  .. \
+ && make -j$NPROC_BUILD \
+ && make install \
+ && cp ./unix-install/opencv4.pc /usr/local/lib/pkgconfig/ \
+ && rm -rf /usr/local/src
+ENV OPENCV_PATH=/usr/local/include/opencv4
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+
+
+# 安装pybind11
+# 本RUN语句新增11M内容
+WORKDIR /usr/local/src
+RUN wget -q $LOCAL_IP/MixedAI/docker_packages/pybind11.zip && unzip -q -d /usr/local/src pybind11.zip \
+ && mkdir pybind11/build \
+ && cd pybind11/build \
+ && cmake .. \
+ && make -j$NPROC_BUILD \
+ && make install \
+ && rm -rf /usr/local/src \
+ENV PYTHONPATH=$PYTHONPATH:/usr/local/include/pybind11
+
+
+# 安装glog
+# 本RUN语句新增426K内容
+WORKDIR /usr/local/src
+RUN wget -q $LOCAL_IP/MixedAI/docker_packages/glog-master.zip && unzip -q -d /usr/local/src glog-master.zip \
+ && mkdir glog-master/build && cd glog-master/build \
+ && cmake .. \
+ && make -j$NPROC_BUILD \
+ && make install \
+ && rm -rf /usr/local/src
+
+
+# pillow-simd是经过针对SIMD（单指令多数据）指令优化的Pillow包，相比于pillow更快，但支持的平台更少，编译时需要-mavx2进行运行检测，相关链接：https://python.freelycode.com/contribution/detail/229
+# 不依赖detectron2之后，pillow-simd不知道还有没有被调用，先安装着吧
+# 由于新加入的一些代码以及项目侧都用到了detectron2，这里只好先给它装回去，择日再重新解除依赖
+# 网络有点问题，访问外网很卡，只能从sambashare中转，待72重启网卡之后才能恢复
+# 安装其他包的时候检测不到Pillow还是会自动安装回来，那先不管pillow-simd吧
+# Q：优化的时候前面的pillow是不是可以不用装？
+# 本RUN语句新增53.7M内容
+# RUN python -m pip install --no-cache-dir detectron2 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu111/torch1.9/index.html \
+WORKDIR /usr/local/src
+RUN wget -q $LOCAL_IP/MixedAI/docker_packages/wheel/detectron2-0.6+cu111-cp38-cp38-linux_x86_64.whl -P ./ \
+ && python3 -m pip install detectron2-0.6+cu111-cp38-cp38-linux_x86_64.whl \
+ && rm -rf /usr/local/src
+# RUN pip uninstall -y pillow \
+#  && CC="cc -mavx2" pip install --no-cache-dir -U --force-reinstall pillow-simd
+
+
+# 配置onnxruntime
+WORKDIR /usr/local/src
+RUN mkdir -p /opt/lib \
+ && wget -rnp -l 0 -nH --cut-dirs=3 -q $LOCAL_IP/MixedAI/docker_packages/onnx/ -R "index.html*" \
+ && cp -r /usr/local/src/onnxruntime-linux-x64-1.8.1/ /opt/lib \
+ && ln -s /opt/lib/onnxruntime-linux-x64-1.8.1/lib/libonnxruntime.so.1.8.1 /opt/lib/onnxruntime-linux-x64-1.8.1/lib/libonnxruntime.so \
+ && echo "export ONNXRUNTIME_DIR=/opt/lib/onnxruntime-linux-x64-1.8.1" >> ~/.bashrc \
+ && echo "export LD_LIBRARY_PATH=\$ONNXRUNTIME_DIR/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc \
+ && rm -rf /usr/local/src
+
+
+# 安装Sphinx文档的依赖：java、字体以及一些主题模板
+# 本RUN语句新增400M内容
+RUN apt-get install -y graphviz graphviz-dev fontconfig xfonts-utils \
+ && apt-get clean && apt-get autoclean && apt-get autoremove -y \
+ && mkdir /usr/local/tmp /usr/local/jdk \
+ && cd /usr/local/tmp \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/jdk/jdk-8u281-linux-x64.tar.gz && tar zxf jdk-8u281-linux-x64.tar.gz -C /usr/local/jdk  \
+ && wget -q $LOCAL_IP/MixedAI/docker_packages/jdk/simsun.ttc -P /usr/share/fonts/simsun \
+ && cd /usr/share/fonts/simsun && mkfontscale && mkfontdir && fc-cache -fv && /bin/bash -c "source /etc/profile" \
+ && rm -rf /usr/local/tmp
+ENV JAVA_HOME=/usr/local/jdk/jdk1.8.0_281
+ENV JRE_HOME=/usr/local/jdk/jdk1.8.0_281/jre
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# 现在镜像有好几种类型，为了一个测试脚本在不同类型上都能用，需要有一个镜像类型的标志符也就是IMAGE_TYPE
+ENV IMAGE_TYPE=release
+
+# CUDA11.0支持不了当前PyTorch版本所使用的8.6的算力，要调低Pytorch使用的算力，否则编译时会报错nvcc fatal: Unsupported gpu architecture
+# 参考链接：https://blog.csdn.net/qq_30614451/article/details/111173703
+# 如果在新机子上使用镜像进行x.cuda()的时候报CUDA Error：no kernel image is available for execution on device错误，
+# 也是这个算力不匹配的问题，需要再进一步研究
+ENV TORCH_CUDA_ARCH_LIST=8.0
+
+# 基础镜像的ulimit -c是unlimited，它会在程序意外中断时（如Ctrl+C）保存一个core文件保留案发现场，
+# 供后续开发者复盘研究，但它会占用内存的缓存，free -h时会看到cache的增大，频繁Ctrl+C会越来越大，因此我们通过ulimit -c 0让它不要保存core文件，节约缓存
+RUN echo "ulimit -c 0" >> ~/.bashrc
+
+# 拉取测试脚本和测试文件，创建测试输出目录，用于后续检验镜像是否正确编译；拉取开机启动脚本
+# -rnp递归拉取整个目录但不拉取上级目录，-nd不创建目录结构，直接拷贝到当前目录
+# -A只拷贝某些文件格式（否则会拷过来一堆html文件），-P指定拷贝目的地
+RUN wget -rnp -nd -q $LOCAL_IP/MixedAI/docker_packages/scripts/ -R "index.html*" -P /usr/local/scripts/
+
+
+WORKDIR /workspace
+
+# 编译完记得测一下 sh /usr/local/scripts/check.sh 能不能过
