@@ -98,6 +98,11 @@ fi
 #    . /etc/bash_completion
 #fi
 
+
+ttpath=/localdata/zhennanc
+export qinghua=" -i https://pypi.tuna.tsinghua.edu.cn/simple"
+
+
 # Aliases
 alias l='ls -l'
 alias a='cd .. && l'
@@ -109,9 +114,12 @@ alias lt='ls -lhrt --color=auto'
 alias via='vi ~/.bashrc'
 alias py='python'
 alias b='cd -'
-alias tt='cd /localdata/zhennanc'
+alias tt='cd $ttpath'
 alias tts='cd /data/home/qijunhuang/czn/code/eggroll-2.x/python/eggroll/roll_site/test'
 alias cl='conda info --envs'
+
+
+
 
 # Functions
 ff() {
@@ -217,6 +225,7 @@ else
 fi
 unset __conda_setup
 # <<< conda initialize <<<
+
 export XDG_CURRENT_DESKTOP=test
 export DETECTRON2_DATASETS=/localdata/zhennanc/data
 export PATH=/usr/local/NVIDIA-Nsight-Compute:$PATH
@@ -234,8 +243,12 @@ export CMAKE_PREFIX_PATH=${version}/share/cmake/Torch:$CMAKE_PREFIX_PATH
 export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 export PYBIND_PATH=${py}/pybind11/share/cmake/pybind11
 
-export http_proxy=http://127.0.0.1:8118
-export https_proxy=http://127.0.0.1:8118
+git config --global user.email "chanzhennan@163.com"
+git config --global user.name "chanzhennan"
+
+
+# export http_proxy=http://127.0.0.1:8118
+# export https_proxy=http://127.0.0.1:8118
 
 
 #export http_proxy=http://14.29.180.89:7500
