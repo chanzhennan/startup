@@ -106,17 +106,15 @@ export qinghua=" -i https://pypi.tuna.tsinghua.edu.cn/simple"
 # Aliases
 alias l='ls -l'
 alias a='cd .. && l'
-alias cc='rz -bye'
-alias q='vi hlod'
 alias shf='sh build.sh'
 alias shc='source ~/.bashrc'
 alias lt='ls -lhrt --color=auto'
-alias via='vi ~/.bashrc'
 alias py='python'
-alias b='cd -'
-alias tt='cd $ttpath'
-alias tts='cd /data/home/qijunhuang/czn/code/eggroll-2.x/python/eggroll/roll_site/test'
 alias cl='conda info --envs'
+
+
+alias tt='cd $ttpath'
+
 
 
 
